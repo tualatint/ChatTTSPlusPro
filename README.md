@@ -13,6 +13,7 @@ Use ChatTTSPlus to turn the `AnimateAnyone` paper into a podcast.
    <video src="https://github.com/user-attachments/assets/82afa5de-1bf2-404a-ab10-06d52b16a8f9" controls="controls" width="300" height="500">Your browser does not support playing this video!</video>
 
 ### New Features
+- [x] Add a stream server, which generates audio from a text within a second.
 - [x] Refactored ChatTTS code in a way I'm familiar with.
 - [x] **Achieved over 3x acceleration with TensorRT**, increasing performance on a Windows 3060 GPU from 28 tokens/s to 110 tokens/s.
 - [x] Windows integration package for one-click extraction and use.
