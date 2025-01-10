@@ -4,6 +4,7 @@
 # @FileName: chattts_plus_pipeline.py
 import lzma
 import os.path
+import pdb
 import time
 from typing import Union
 
@@ -160,11 +161,37 @@ class ChatTTSPlusPipeline:
             stream: bool,
             return_hidden: bool,
             params: InferCodeParams,
-    ): 
-        temperature = [params.temperature] * self.models_dict["gpt"].num_vq
-        # text = [t.replace("[Stts]", "").replace("[spk_emb]", "").replace("[empty_spk]", "").strip() for t in text]
+    ):
+        self.logger.info("Start inference audio code >>>>")
+        if not isinstance(text, list):
+            text = [text]
 
-        text = [f"[Stts][spk_emb]{params.prompt}{i}[Ptts]" for i in text]
+        assert len(text), "text should not be empty"
+
+        if not isinstance(params.temperature, list):
+            temperature = [params.temperature] * self.models_dict["gpt"].num_vq
+        else:
+            temperature = params.temperature
+
+        for i, t in enumerate(text):
+            text[i] = (
+                t.replace("[Stts]", "")
+                .replace("[spk_emb]", "")
+                .replace("[empty_spk]", "")
+                .strip()
+            )
+            """
+            see https://github.com/2noise/ChatTTS/issues/459
+            """
+
+        if params.prompt:
+            text = [params.prompt + i for i in text]
+
+        txt_smp = "" if params.txt_smp is None else params.txt_smp
+        if params.spk_emb is not None:
+            text = [f"[Stts][spk_emb]{txt_smp}{i}[Ptts]" for i in text]
+        else:
+            text = [f"[Stts][empty_spk]{txt_smp}{i}[Ptts]" for i in text]
         input_ids, attention_mask, text_mask = self.models_dict["tokenizer"].encode(
             text,
             self.models_dict["gpt"].num_vq,
@@ -173,9 +200,11 @@ class ChatTTSPlusPipeline:
         )
 
         emb = self.models_dict["gpt"](input_ids, text_mask)
-        self.models_dict["tokenizer"].apply_spk_emb(
-            emb, params.spk_emb, input_ids, self.device
-        )
+
+        if params.spk_emb is not None:
+            self.models_dict["tokenizer"].apply_spk_emb(
+                emb, params.spk_emb, input_ids, self.device
+            )
 
         num_code = int(self.models_dict["gpt"].emb_code[0].num_embeddings - 1)
 
@@ -253,22 +282,27 @@ class ChatTTSPlusPipeline:
             wav = torch.from_numpy(wav).to(self.device, dtype=self.dtype)
         return self.models_dict["tokenizer"]._encode_prompt(
             self.models_dict["dvae_encode"](wav[None], "encode").squeeze_(0))
-    
+
     @torch.inference_mode()
-    def _decode_to_wavs(self, result_list, use_decoder: bool):
+    def _decode_to_wavs(
+            self,
+            result_list,
+            use_decoder: bool,
+    ):
+        self.logger.info("Start decode to wavs >>>>")
         decoder = self.models_dict["dvae_decode"] if use_decoder else self.models_dict["dvae_encode"]
-        if not result_list:
-            return []
+        wavs = []
+        if len(result_list) == 0:
+            return wavs
 
-        src_list = [res.permute(1, 0) for res in result_list]
-        src_batch = torch.stack(src_list, dim=0)
-        src_batch = src_batch.to(next(self.models_dict["vocos"].parameters()).device)
-
-        mel_specs_batch = decoder(src_batch)
-        mel_specs_batch = mel_specs_batch.to(dtype=next(self.models_dict["vocos"].parameters()).dtype)
-        wav_batch = self.models_dict["vocos"].decode(mel_specs_batch)
-
-        return wav_batch
+        for i in range(len(result_list)):
+            src = result_list[i].permute(1, 0)
+            mel_specs = decoder(src[None]).to(dtype=next(self.models_dict["vocos"].parameters()).dtype)
+            if "mps" in str(mel_specs.device):
+                mel_specs = mel_specs.to(device=torch.device("cpu"))
+            wav_ = self.models_dict["vocos"].decode(mel_specs)
+            wavs.append(wav_[0])
+        return wavs
 
     def sample_random_speaker(self) -> str:
         return self._encode_spk_emb(self._sample_random_speaker())
@@ -312,44 +346,128 @@ class ChatTTSPlusPipeline:
             **kwargs
     ):
 
+        if not isinstance(text_in, list):
+            text_in = [text_in]
+
+        # 参考chattts-ui做分割、合并以及数字转换等优化
+        if do_text_optimization:
+            self.logger.info("Optimization on text, such as split, merge and so on")
+            text_list = []
+            for text_ in text_in:
+                text_list.extend([t.strip() for t in text_.split("\n") if t.strip()])
+            new_text = text_utils.split_text(text_list)
+            retext = []
+            short_text = ""
+            for it in new_text:
+                if len(it) < 30:
+                    short_text += f"{it} [uv_break] "
+                    if len(short_text) > 30:
+                        retext.append(short_text)
+                        short_text = ""
+                else:
+                    retext.append(short_text + it)
+                    short_text = ""
+            if len(short_text) > 30 or len(retext) < 1:
+                retext.append(short_text)
+            elif short_text:
+                retext[-1] += f" [uv_break] {short_text}"
+
+            text_in = retext
+            self.logger.info("Finish text optimization: ")
+            self.logger.info(text_in)
+
+        text_in = [
+            self.normalizer(
+                t,
+                do_text_normalization,
+                do_homophone_replacement,
+                lang,
+            )
+            for t in text_in
+        ]
+        self.logger.info("Finish text normalization: ")
+        self.logger.info(text_in)
+
         slice_size = kwargs.get("slice_size", 4)
+        if len(text_in) > slice_size:
+            self.logger.warning(
+                f"len of text is {len(text_in)} > 4, only support max batch size is equal to 4, so we need to slice to inference")
 
         for ii in tqdm(range(0, len(text_in), slice_size)):
             text = text_in[ii:ii + slice_size].copy()
-
-            # if not skip_refine_text:
-            #     self.logger.info("Process Text Refinement >>>")
-            #     refined = self._refine_text(
-            #         text,
-            #         params_refine_text
-            #     )
-            #     text_tokens = refined.ids
-            #     text_tokens = [i[i.less(self.models_dict["tokenizer"].break_0_ids)] for i in text_tokens]
-            #     text = self.models_dict["tokenizer"].decode(text_tokens)
-            #     self.logger.info("Refine text: ")
-            #     self.logger.info(text)
-            #     if refine_text_only:
-            #         yield text
-
-            length = 0
-            for result in self._infer_code(
+            # refine text
+            if not skip_refine_text:
+                self.logger.info("Process Text Refinement >>>")
+                refined = self._refine_text(
                     text,
-                    stream,
-                    use_decoder,
-                    params_infer_code
-            ):
-                wavs = self._decode_to_wavs(
-                    result.hiddens if use_decoder else result.ids,
-                    use_decoder,
+                    params_refine_text
                 )
+                text_tokens = refined.ids
+                text_tokens = [i[i.less(self.models_dict["tokenizer"].break_0_ids)] for i in text_tokens]
+                text = self.models_dict["tokenizer"].decode(text_tokens)
+                self.logger.info("Refine text: ")
+                self.logger.info(text)
+                if refine_text_only:
+                    yield text
+
+            if not refine_text_only:
+                for ti in range(len(text)):
+                    if not text[ti].strip().endswith("[uv_break]"):
+                        text[ti] += " [uv_break]"
                 if stream:
-                    a = length
-                    b = a + params_infer_code.stream_speed
-                    if b > wavs[0].shape[0]:  # Ensure `b` does not exceed the length of the audio
-                        b = wavs[0].shape[0]
-                    new_wavs = [wavs[0][a:b]]  # Correctly slice the first element of the list
-                    length = b
-                    yield new_wavs
+                    length = 0
+                    pass_batch_count = 0
+                if kwargs.get("lora_path", None):
+                    if self.infer_type == "pytorch":
+                        from peft import PeftModel
+                        import copy
+                        self.logger.info(f"load lora into gpt: {kwargs.get('lora_path')}")
+                        self.models_dict['gpt'].gpt_org = self.models_dict['gpt'].gpt.cpu()
+                        peft_model = PeftModel.from_pretrained(copy.deepcopy(self.models_dict['gpt'].gpt),
+                                                               kwargs.get("lora_path"),
+                                                               device_map=self.device,
+                                                               torch_dtype=self.dtype)
+                        peft_model.config.use_cache = True
+                        peft_model = peft_model.merge_and_unload()
+                        self.models_dict['gpt'].gpt = peft_model.to(self.device, dtype=self.dtype)
+                    else:
+                        self.logger.error("Lora only support pytorch Now!")
+                for result in self._infer_code(
+                        text,
+                        stream,
+                        use_decoder,
+                        params_infer_code
+                ):
+                    wavs = self._decode_to_wavs(
+                        result.hiddens if use_decoder else result.ids,
+                        use_decoder,
+                    )
+                    if stream:
+                        pass_batch_count += 1
+                        if pass_batch_count <= params_infer_code.pass_first_n_batches:
+                            continue
+                        a = length
+                        b = a + params_infer_code.stream_speed
+                        if b > wavs.shape[1]:
+                            b = wavs.shape[1]
+                        new_wavs = wavs[:, a:b]
+                        length = b
+                        yield new_wavs
+                    else:
+                        yield wavs
+                if stream:
+                    new_wavs = wavs[:, length:]
+                    # Identify rows with non-zero elements using np.any
+                    # keep_rows = np.any(array != 0, axis=1)
+                    keep_cols = np.sum(new_wavs != 0, axis=0) > 0
+                    # Filter both rows and columns using slicing
+                    yield new_wavs[:][:, keep_cols]
+                if kwargs.get("lora_path", None):
+                    if self.infer_type == "pytorch":
+                        self.logger.info("unload lora !")
+                        del self.models_dict['gpt'].gpt
+                        torch.cuda.empty_cache()
+                        self.models_dict['gpt'].gpt = self.models_dict['gpt'].gpt_org.to(self.device, dtype=self.dtype)
 
     @torch.no_grad()
     def infer(self,
@@ -383,7 +501,7 @@ class ChatTTSPlusPipeline:
         elif kwargs.get("speaker_emb_path", None):
             speaker_emb_path = kwargs.get("speaker_emb_path", None)
             assert os.path.exists(speaker_emb_path), f"speaker_emb_path {speaker_emb_path} not exists!"
-            # self.logger.info(f"loading speaker_emb from {speaker_emb_path}")
+            self.logger.info(f"loading speaker_emb from {speaker_emb_path}")
             speaker_emb = torch.load(speaker_emb_path)
             params_infer_code.spk_emb = speaker_emb
         else:
@@ -396,6 +514,11 @@ class ChatTTSPlusPipeline:
             os.makedirs(SPEAKER_DIR, exist_ok=True)
             torch.save(speaker_emb, f"{SPEAKER_DIR}/{time.time()}.pt")
             self.logger.info(f"saving speaker emb at: {SPEAKER_DIR}/{time.time()}.pt")
+
+        self.logger.info("Params refine text:")
+        self.logger.info(params_refine_text.__dict__)
+        self.logger.info("Params infer code:")
+        self.logger.info(params_infer_code.__dict__)
 
         res_gen = self._infer(
             text,
